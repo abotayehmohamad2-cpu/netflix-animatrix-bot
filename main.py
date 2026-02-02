@@ -12,13 +12,25 @@ from telegram.ext import (
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")  # مثال: https://v7ty4ob6m6.onrender.com
-ADMIN_ID = os.getenv("ADMIN_ID")  # اختياري: رقم تيليجرام تبعك
+
+# Render أحيانًا يعطيك رابط جاهز بهذا المتغير، بنستخدمه إذا موجود
+EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # مثال: https://xxxx.onrender.com
+
+# وإذا مش موجود، استخدم APP_URL اللي بتحطه إنت
+APP_URL = os.getenv("APP_URL")
+
+ADMIN_ID = os.getenv("ADMIN_ID")  # اختياري (قيمة رقمك)
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing. Add it in Render Env Vars")
-if not APP_URL:
-    raise ValueError("APP_URL missing. Add it in Render Env Vars (must be full https://xxxx.onrender.com)")
+
+BASE_URL = (EXTERNAL_URL or APP_URL or "").strip().rstrip("/")
+
+if not BASE_URL.startswith("https://"):
+    raise ValueError(
+        "APP_URL missing or invalid. Put full URL like: https://xxxx.onrender.com "
+        "(NOT t.me link)"
+    )
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,10 +59,9 @@ def prizes_menu() -> InlineKeyboardMarkup:
 # HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /start
     await update.message.reply_text(
         "أهلًا 👋\n"
-        "هذا بوت تجريبي شغال على Render عبر Webhook ✅\n\n"
+        "البوت شغال على Render ✅\n\n"
         "اختار من القائمة:",
         reply_markup=main_menu(),
     )
@@ -76,8 +87,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "check":
         await query.edit_message_text(
-            "✅ البوت شغال تمام.\n"
-            "إذا بدك نكمل نضيف نظام جوائز/أكواد خبرني.",
+            "✅ البوت شغال تمام.",
             reply_markup=prizes_menu(),
         )
 
@@ -85,16 +95,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "ℹ️ المساعدة:\n"
             "- البوت شغال Webhook على Render.\n"
-            "- افتح تيليجرام وابعت /start.\n\n"
-            "ملاحظة: فتح رابط Render بالمتصفح قد يعطي 404 وهذا طبيعي.",
+            "- ابعت /start.\n\n"
+            "ملاحظة: فتح رابط Render بالمتصفح ممكن يعطي 404 وهذا طبيعي.",
             reply_markup=main_menu(),
         )
 
     elif query.data == "back":
-        await query.edit_message_text(
-            "اختار من القائمة:",
-            reply_markup=main_menu(),
-        )
+        await query.edit_message_text("اختار من القائمة:", reply_markup=main_menu())
 
 # =========================
 # MAIN (WEBHOOK)
@@ -108,12 +115,15 @@ def main():
 
     port = int(os.environ.get("PORT", "10000"))
 
-    # webhook path = BOT_TOKEN (لأمان أكثر)
+    # نخلي مسار الويبهوك = التوكن (سري)
+    url_path = BOT_TOKEN
+    webhook_url = f"{BASE_URL}/{url_path}"
+
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{APP_URL}/{BOT_TOKEN}",
+        url_path=url_path,
+        webhook_url=webhook_url,
     )
 
 if __name__ == "__main__":
