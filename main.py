@@ -1,12 +1,15 @@
 import os
 import re
-import time
 import sqlite3
 import logging
-import asyncio
-from typing import Optional, Tuple
+from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,40 +21,36 @@ from telegram.ext import (
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-APP_URL = os.getenv("APP_URL", "").strip().rstrip("/")  # https://xxxx.onrender.com
-ADMIN_ID = int(os.getenv("ADMIN_ID", "6417297177").strip() or "6417297177")
-PORT = int(os.environ.get("PORT", "10000"))
+APP_URL = os.getenv("APP_URL", "").strip()  # must be like: https://xxxx.onrender.com
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing (Render Env Vars)")
-if not APP_URL.startswith("https://"):
-    raise ValueError("APP_URL invalid. Example: https://xxxx.onrender.com")
+    raise ValueError("BOT_TOKEN missing. Add it in Render Env Vars.")
+if not APP_URL or not APP_URL.startswith("https://") or ".onrender.com" not in APP_URL:
+    raise ValueError("APP_URL missing/invalid. Example: https://xxxx.onrender.com")
+if not ADMIN_ID:
+    raise ValueError("ADMIN_ID missing. Put your Telegram numeric ID.")
 
-# =========================
-# LOGGING
-# =========================
+PORT = int(os.environ.get("PORT", "10000"))
+DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
+
 logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("rewards-bot")
+logger = logging.getLogger("bot")
 
 # =========================
 # DB
 # =========================
-DB_PATH = "bot.db"
-
-def now_ts() -> int:
-    return int(time.time())
-
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    con = db()
-    cur = con.cursor()
+    conn = db()
+    cur = conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS settings (
@@ -64,739 +63,689 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         points INTEGER NOT NULL DEFAULT 0,
-        ref_by INTEGER,
-        ref_paid INTEGER NOT NULL DEFAULT 0,
-        join_verified INTEGER NOT NULL DEFAULT 0,
+        referred_by INTEGER,
+        ref_rewarded INTEGER NOT NULL DEFAULT 0,
+        verified INTEGER NOT NULL DEFAULT 0,
         banned INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
+        created_at TEXT NOT NULL
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stock (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item TEXT NOT NULL,          -- الكود/القسيمة/المنتج الرقمي
-        used INTEGER NOT NULL DEFAULT 0,
-        used_by INTEGER,
-        used_at INTEGER,
-        added_at INTEGER NOT NULL
+        item TEXT NOT NULL,          -- e.g. "Netflix Account"
+        price INTEGER NOT NULL,      -- points needed
+        payload TEXT NOT NULL,       -- the actual account/code text
+        added_at TEXT NOT NULL,
+        claimed_by INTEGER,
+        claimed_at TEXT
     )
     """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS purchases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        item TEXT NOT NULL,
-        cost INTEGER NOT NULL,
-        delivered_text TEXT,
-        created_at INTEGER NOT NULL
-    )
-    """)
+    # defaults
+    cur.execute("INSERT OR IGNORE INTO settings (k,v) VALUES ('reward_per_ref', '1')")
+    cur.execute("INSERT OR IGNORE INTO settings (k,v) VALUES ('support_user', '@Support')")
+    cur.execute("INSERT OR IGNORE INTO settings (k,v) VALUES ('required_channels', '@animatrix2026,@animatrix27')")
 
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
-def set_setting(k: str, v: str):
-    con = db()
-    con.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
-    con.commit()
-    con.close()
+def get_setting(key: str) -> str:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT v FROM settings WHERE k=?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row["v"] if row else ""
 
-def get_setting(k: str, default: str = "") -> str:
-    con = db()
-    row = con.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
-    con.close()
-    return row["v"] if row else default
+def set_setting(key: str, value: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO settings (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+    conn.commit()
+    conn.close()
 
-def ensure_defaults():
-    # قنوات اشتراك اجباري افتراضيًا (تقدر تغيرهم)
-    if not get_setting("ch1"):
-        set_setting("ch1", "@animatrix2026")
-    if not get_setting("ch2"):
-        set_setting("ch2", "@animatrix27")
-
-    if not get_setting("support"):
-        set_setting("support", "@Support")
-    if not get_setting("help_center"):
-        set_setting("help_center", "Help Center:\n- Join required channels then press ✅ JOINED\n- Earn points via referrals\n- Use Withdraw to redeem your reward")
-
-    if not get_setting("ref_reward"):
-        set_setting("ref_reward", "1")
-
-    # اسم المنتج في Withdraw + سعره بالنقاط (عام)
-    if not get_setting("item_name"):
-        set_setting("item_name", "Premium Reward")
-    if not get_setting("item_price"):
-        set_setting("item_price", "4")
-
-# =========================
-# USERS
-# =========================
-def ensure_user(user_id: int, ref_by: Optional[int] = None):
-    con = db()
-    cur = con.cursor()
-    row = cur.execute("SELECT user_id, ref_by FROM users WHERE user_id=?", (user_id,)).fetchone()
+def ensure_user(user_id: int, referred_by: int | None = None):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
     if not row:
         cur.execute(
-            "INSERT INTO users(user_id, points, ref_by, ref_paid, join_verified, banned, created_at) VALUES(?,?,?,?,?,?,?)",
-            (user_id, 0, ref_by, 0, 0, 0, now_ts())
+            "INSERT INTO users (user_id, points, referred_by, created_at) VALUES (?,?,?,?)",
+            (user_id, 0, referred_by, datetime.utcnow().isoformat()),
         )
     else:
-        # إذا user جديد وبدا ref_by نثبته مرة وحدة
-        if ref_by and (row["ref_by"] is None or int(row["ref_by"] or 0) == 0) and ref_by != user_id:
-            cur.execute("UPDATE users SET ref_by=? WHERE user_id=?", (ref_by, user_id))
-    con.commit()
-    con.close()
-
-def get_user(user_id: int) -> sqlite3.Row:
-    con = db()
-    row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    con.close()
-    return row
+        # if user exists but no referred_by stored yet, store it once
+        if referred_by:
+            cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
+            r = cur.fetchone()
+            if r and (r["referred_by"] is None):
+                cur.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referred_by, user_id))
+    conn.commit()
+    conn.close()
 
 def is_banned(user_id: int) -> bool:
-    u = get_user(user_id)
-    return bool(u and int(u["banned"]) == 1)
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT banned FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row["banned"] == 1)
 
-def set_ban(user_id: int, banned: bool):
-    con = db()
-    con.execute("UPDATE users SET banned=? WHERE user_id=?", (1 if banned else 0, user_id))
-    con.commit()
-    con.close()
+def set_verified(user_id: int, verified: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET verified=? WHERE user_id=?", (verified, user_id))
+    conn.commit()
+    conn.close()
+
+def get_points(user_id: int) -> int:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT points FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row["points"]) if row else 0
 
 def add_points(user_id: int, amount: int):
-    con = db()
-    con.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
-    con.commit()
-    con.close()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
 
-def set_points(user_id: int, points: int):
-    con = db()
-    con.execute("UPDATE users SET points=? WHERE user_id=?", (points, user_id))
-    con.commit()
-    con.close()
+def take_points(user_id: int, amount: int) -> bool:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT points FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+    if row["points"] < amount:
+        conn.close()
+        return False
+    cur.execute("UPDATE users SET points = points - ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
+    return True
 
-def users_count() -> int:
-    con = db()
-    row = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()
-    con.close()
-    return int(row["c"] or 0)
+def referral_reward_if_needed(new_user_id: int) -> int | None:
+    """
+    If new user has referred_by and not rewarded yet and is verified => reward referrer
+    Returns referrer_id if rewarded else None
+    """
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT referred_by, ref_rewarded, verified FROM users WHERE user_id=?", (new_user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    if row["verified"] != 1 or row["ref_rewarded"] == 1 or not row["referred_by"]:
+        conn.close()
+        return None
+
+    referrer_id = int(row["referred_by"])
+    reward = int(get_setting("reward_per_ref") or "1")
+
+    # mark rewarded + give points
+    cur.execute("UPDATE users SET ref_rewarded=1 WHERE user_id=?", (new_user_id,))
+    cur.execute("UPDATE users SET points = points + ? WHERE user_id=?", (reward, referrer_id))
+    conn.commit()
+    conn.close()
+    return referrer_id
+
+def add_stock(item: str, price: int, payload: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO stock (item, price, payload, added_at) VALUES (?,?,?,?)",
+        (item, price, payload, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+def stock_count(item: str, price: int) -> int:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM stock WHERE item=? AND price=? AND claimed_by IS NULL",
+        (item, price),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row["c"]) if row else 0
+
+def claim_one_stock(item: str, price: int, user_id: int) -> str | None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, payload FROM stock WHERE item=? AND price=? AND claimed_by IS NULL ORDER BY id ASC LIMIT 1",
+        (item, price),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    stock_id = int(row["id"])
+    payload = str(row["payload"])
+
+    cur.execute(
+        "UPDATE stock SET claimed_by=?, claimed_at=? WHERE id=?",
+        (user_id, datetime.utcnow().isoformat(), stock_id),
+    )
+    conn.commit()
+    conn.close()
+    return payload
 
 # =========================
-# SETTINGS HELPERS
+# REQUIRED JOIN (channels)
+# =========================
+def parse_channels(raw: str) -> list[str]:
+    # supports "@channel" or "https://t.me/channel"
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    out = []
+    for p in parts:
+        if p.startswith("https://t.me/"):
+            p = p.replace("https://t.me/", "").strip()
+        if p.startswith("@"):
+            out.append(p)
+        else:
+            out.append("@"+p)
+    return out
+
+async def is_member(bot, channel: str, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        # member.status can be: creator, administrator, member, restricted, left, kicked
+        return m.status in ("creator", "administrator", "member")
+    except Exception as e:
+        # Most common: bot not admin in channel, or channel username wrong.
+        logger.warning(f"get_chat_member failed for {channel}: {e}")
+        return False
+
+async def check_required_join(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    channels = parse_channels(get_setting("required_channels"))
+    if not channels:
+        return True
+
+    for ch in channels:
+        ok = await is_member(context.bot, ch, user_id)
+        if not ok:
+            return False
+    return True
+
+def join_keyboard() -> InlineKeyboardMarkup:
+    channels = parse_channels(get_setting("required_channels"))
+    buttons = []
+    for i, ch in enumerate(channels, start=1):
+        url = f"https://t.me/{ch.lstrip('@')}"
+        buttons.append([InlineKeyboardButton(f"➡️ Join Channel {i}", url=url)])
+    buttons.append([InlineKeyboardButton("✅ JOINED", callback_data="joined_check")])
+    return InlineKeyboardMarkup(buttons)
+
+# =========================
+# MENUS
+# =========================
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 BALANCE", callback_data="balance"),
+         InlineKeyboardButton("👥 REFER", callback_data="refer")],
+        [InlineKeyboardButton("💳 WITHDRAW", callback_data="withdraw"),
+         InlineKeyboardButton("🆘 SUPPORT", callback_data="support")],
+        [InlineKeyboardButton("📦 STOCK", callback_data="stock")],
+    ])
+
+def back_btn() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="back")]])
+
+def withdraw_menu() -> InlineKeyboardMarkup:
+    # You can expand later for multiple items/prices
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Netflix Account [4 Points]", callback_data="buy_netflix_4")],
+        [InlineKeyboardButton("⬅️ BACK", callback_data="back")],
+    ])
+
+# =========================
+# HELPERS
 # =========================
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-def ref_reward_points() -> int:
-    try:
-        return max(0, int(get_setting("ref_reward", "1")))
-    except:
-        return 1
-
-def item_name() -> str:
-    return get_setting("item_name", "Premium Reward").strip() or "Premium Reward"
-
-def item_price() -> int:
-    try:
-        return max(0, int(get_setting("item_price", "4")))
-    except:
-        return 4
-
-def support_text() -> str:
-    return get_setting("support", "@Support").strip() or "@Support"
-
-def help_center_text() -> str:
-    return get_setting("help_center", "Help Center").strip()
-
-def normalize_channel(x: str) -> str:
-    x = (x or "").strip()
-    if not x:
-        return ""
-    # allow t.me/xxx, https://t.me/xxx, @xxx, xxx
-    x = x.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
-    x = x.strip().strip("/")
-    if not x:
-        return ""
-    if x.startswith("@"):
-        return x
-    return f"@{x}"
-
-def get_channels() -> Tuple[str, str]:
-    ch1 = normalize_channel(get_setting("ch1", ""))
-    ch2 = normalize_channel(get_setting("ch2", ""))
-    return ch1, ch2
-
-# =========================
-# FORCE JOIN CHECK
-# =========================
-async def is_member(context: ContextTypes.DEFAULT_TYPE, channel: str, user_id: int) -> bool:
-    if not channel:
-        return True
-    try:
-        m = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
-        return m.status in ("member", "administrator", "creator")
-    except Exception as e:
-        # إذا البوت مش Admin بالقناة غالبًا بيصير خطأ
-        log.warning(f"get_chat_member failed for {channel}: {e}")
-        return False
-
-def join_gate_kb(ch1: str, ch2: str) -> InlineKeyboardMarkup:
-    rows = []
-    if ch1:
-        rows.append([InlineKeyboardButton("➡️ Join Channel 1", url=f"https://t.me/{ch1.lstrip('@')}")])
-    if ch2:
-        rows.append([InlineKeyboardButton("➡️ Join Channel 2", url=f"https://t.me/{ch2.lstrip('@')}")])
-    rows.append([InlineKeyboardButton("✅ JOINED", callback_data="verify_join")])
-    return InlineKeyboardMarkup(rows)
-
-async def require_join_or_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    u = get_user(user_id)
-    if u and int(u["join_verified"]) == 1:
-        return True
-
-    ch1, ch2 = get_channels()
-    # إذا ما في قنوات، اعتبره Verified
-    if not ch1 and not ch2:
-        con = db()
-        con.execute("UPDATE users SET join_verified=1 WHERE user_id=?", (user_id,))
-        con.commit()
-        con.close()
-        return True
-
-    ok1 = await is_member(context, ch1, user_id) if ch1 else True
-    ok2 = await is_member(context, ch2, user_id) if ch2 else True
-    if ok1 and ok2:
-        con = db()
-        con.execute("UPDATE users SET join_verified=1 WHERE user_id=?", (user_id,))
-        con.commit()
-        con.close()
-        return True
-
-    text = "❌ Join channel first!\n\nJoin both channels then press ✅ JOINED"
-    kb = join_gate_kb(ch1, ch2)
-
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb)
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
-    return False
-
-# =========================
-# STOCK / PURCHASE (ATOMIC)
-# =========================
-def stock_available_count() -> int:
-    con = db()
-    row = con.execute("SELECT COUNT(*) AS c FROM stock WHERE used=0").fetchone()
-    con.close()
-    return int(row["c"] or 0)
-
-def add_stock_items(items: list[str]) -> int:
-    items = [x.strip() for x in items if x.strip()]
-    if not items:
-        return 0
-    con = db()
-    con.executemany(
-        "INSERT INTO stock(item, used, used_by, used_at, added_at) VALUES(?,0,NULL,NULL,?)",
-        [(it, now_ts()) for it in items]
-    )
-    con.commit()
-    con.close()
-    return len(items)
-
-def purchase_one(user_id: int, cost: int) -> Tuple[bool, str]:
-    """
-    Atomic:
-    - check points
-    - take stock
-    - deduct points
-    - mark used
-    - insert purchase
-    """
-    con = db()
-    cur = con.cursor()
-    try:
-        cur.execute("BEGIN IMMEDIATE")
-
-        u = cur.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not u:
-            con.rollback()
-            return False, "User not found."
-
-        pts = int(u["points"] or 0)
-        if pts < cost:
-            con.rollback()
-            return False, f"Not enough points. You have {pts}, need {cost}."
-
-        row = cur.execute("SELECT id, item FROM stock WHERE used=0 ORDER BY id ASC LIMIT 1").fetchone()
-        if not row:
-            con.rollback()
-            return False, "Out of stock."
-
-        sid = int(row["id"])
-        item = row["item"]
-
-        cur.execute("UPDATE stock SET used=1, used_by=?, used_at=? WHERE id=?", (user_id, now_ts(), sid))
-        cur.execute("UPDATE users SET points = points - ? WHERE user_id=?", (cost, user_id))
-        cur.execute(
-            "INSERT INTO purchases(user_id, item, cost, delivered_text, created_at) VALUES(?,?,?,?,?)",
-            (user_id, item_name(), cost, item, now_ts())
-        )
-
-        con.commit()
-        return True, item
-    except Exception as e:
-        con.rollback()
-        return False, f"Purchase error: {e}"
-    finally:
-        con.close()
-
-# =========================
-# UI
-# =========================
-def main_menu_kb(admin: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("💰 Balance", callback_data="balance"),
-         InlineKeyboardButton("🧑‍🤝‍🧑 Referral", callback_data="referral")],
-        [InlineKeyboardButton("💵 Withdraw", callback_data="withdraw"),
-         InlineKeyboardButton("🆘 Support", callback_data="support")],
-        [InlineKeyboardButton("❓ Help Center", callback_data="help_center")],
-    ]
-    if admin:
-        rows.append([InlineKeyboardButton("🛠 Admin", callback_data="admin")])
-    return InlineKeyboardMarkup(rows)
-
-def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="home")]])
-
-def withdraw_kb() -> InlineKeyboardMarkup:
-    price = item_price()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎁 {item_name()} [{price} Points]", callback_data="buy_item")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="home")]
-    ])
-
-def admin_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("📦 Stock", callback_data="admin_stock")],
-        [InlineKeyboardButton("📣 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👤 Users/Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="home")],
-    ]
-    return InlineKeyboardMarkup(rows)
+def parse_start_ref(text: str) -> int | None:
+    # /start 123456 or /start=123 etc
+    m = re.search(r"/start\s+(\d+)", text or "")
+    if m:
+        rid = int(m.group(1))
+        return rid
+    return None
 
 # =========================
 # HANDLERS
 # =========================
-async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user.id)
+    if not user:
+        return
+    user_id = user.id
 
-    if is_banned(user.id):
-        if update.message:
-            await update.message.reply_text("🚫 You are banned.")
-        else:
-            await update.callback_query.edit_message_text("🚫 You are banned.")
+    if is_banned(user_id):
         return
 
-    if not await require_join_or_block(update, context):
+    ref_id = None
+    if update.message and update.message.text:
+        ref_id = parse_start_ref(update.message.text)
+
+    # avoid self-ref
+    if ref_id == user_id:
+        ref_id = None
+
+    ensure_user(user_id, referred_by=ref_id)
+
+    # force join check
+    ok = await check_required_join(update, context, user_id)
+    if not ok:
+        set_verified(user_id, 0)
+        await update.message.reply_text(
+            "❌ Join channel first!\n\n"
+            "Join all channels ثم اضغط ✅ JOINED.",
+            reply_markup=join_keyboard(),
+        )
         return
 
-    admin = is_admin(user.id)
-    text = "✅ Welcome! Select from menu:"
-    kb = main_menu_kb(admin)
+    # verified
+    set_verified(user_id, 1)
 
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb)
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    # reward referrer if needed
+    referrer = referral_reward_if_needed(user_id)
+    if referrer:
+        reward = int(get_setting("reward_per_ref") or "1")
+        try:
+            await context.bot.send_message(
+                chat_id=referrer,
+                text=f"✅ New referral verified!\nYou earned +{reward} point(s).",
+            )
+        except Exception:
+            pass
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # referral: /start 123456
-    ref_by = None
-    if context.args and context.args[0].isdigit():
-        ref_by = int(context.args[0])
-        if ref_by == user.id:
-            ref_by = None
+    await update.message.reply_text(
+        "✅ Welcome! Select from menu:",
+        reply_markup=main_menu(),
+    )
 
-    ensure_user(user.id, ref_by=ref_by)
-    await show_home(update, context)
+async def on_joined_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    user_id = q.from_user.id
+    await q.answer()
+
+    ok = await check_required_join(update, context, user_id)
+    if not ok:
+        await q.edit_message_text(
+            "❌ Still not joined!\nJoin all channels ثم اضغط ✅ JOINED.",
+            reply_markup=join_keyboard(),
+        )
+        return
+
+    set_verified(user_id, 1)
+
+    # reward referrer if needed (now that verified)
+    referrer = referral_reward_if_needed(user_id)
+    if referrer:
+        reward = int(get_setting("reward_per_ref") or "1")
+        try:
+            await context.bot.send_message(
+                chat_id=referrer,
+                text=f"✅ New referral verified!\nYou earned +{reward} point(s).",
+            )
+        except Exception:
+            pass
+
+    await q.edit_message_text(
+        "✅ Verified! Select from menu:",
+        reply_markup=main_menu(),
+    )
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    user = update.effective_user
+    if not q:
+        return
+    user_id = q.from_user.id
     await q.answer()
 
-    ensure_user(user.id)
-
-    if is_banned(user.id):
-        await q.edit_message_text("🚫 You are banned.")
+    if is_banned(user_id):
         return
 
-    data = q.data
-
-    if data == "home":
-        await show_home(update, context)
-        return
-
-    if data == "verify_join":
-        # verify and open menu + referral reward once
-        passed = await require_join_or_block(update, context)
-        if not passed:
-            return
-
-        # referral reward (only once after verified)
-        u = get_user(user.id)
-        if u and int(u["ref_paid"]) == 0 and u["ref_by"]:
-            ref_by = int(u["ref_by"])
-            pts = ref_reward_points()
-            add_points(ref_by, pts)
-
-            con = db()
-            con.execute("UPDATE users SET ref_paid=1 WHERE user_id=?", (user.id,))
-            con.commit()
-            con.close()
-
-            try:
-                await context.bot.send_message(ref_by, f"🎉 New verified referral! +{pts} point(s).")
-            except:
-                pass
-
-        await q.edit_message_text("✅ Verified! Select from menu:", reply_markup=main_menu_kb(is_admin(user.id)))
-        return
-
-    # Block all actions until joined
-    if not await require_join_or_block(update, context):
-        return
-
-    if data == "balance":
-        pts = get_user(user.id)["points"]
-        await q.edit_message_text(f"💰 Your balance: *{pts}* points.", parse_mode="Markdown", reply_markup=back_kb())
-
-    elif data == "referral":
-        link = f"https://t.me/{context.bot.username}?start={user.id}"
-        reward = ref_reward_points()
-        await q.edit_message_text(
-            "🧑‍🤝‍🧑 *Referral*\n\n"
-            f"Your link:\n`{link}`\n\n"
-            f"⭐ Reward per join+verify: *{reward}* point(s).",
-            parse_mode="Markdown",
-            reply_markup=back_kb(),
-        )
-
-    elif data == "withdraw":
-        pts = get_user(user.id)["points"]
-        price = item_price()
-        stock = stock_available_count()
-        await q.edit_message_text(
-            "📩 Exchange your points for a reward.\n\n"
-            f"💰 Balance: *{pts}* points\n"
-            f"📦 Stock: *{stock}*\n"
-            f"💵 Price: *{price}* points\n",
-            parse_mode="Markdown",
-            reply_markup=withdraw_kb(),
-        )
-
-    elif data == "buy_item":
-        price = item_price()
-        ok, result = purchase_one(user.id, price)
+    # if not verified, block menu actions
+    if q.data not in ("joined_check",) and get_points(user_id) is not None:
+        # enforce join for any action too
+        ok = await check_required_join(update, context, user_id)
         if not ok:
-            await q.edit_message_text(f"❌ {result}", reply_markup=back_kb())
+            set_verified(user_id, 0)
+            await q.edit_message_text(
+                "❌ Join channel first!\nJoin all channels ثم اضغط ✅ JOINED.",
+                reply_markup=join_keyboard(),
+            )
             return
+        else:
+            set_verified(user_id, 1)
 
-        # Send item in separate message (أفضل)
-        await q.edit_message_text("✅ Purchased successfully! Check your DM/message below 👇", reply_markup=back_kb())
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=f"🎁 {item_name()}:\n\n`{result}`\n\n✅ Keep it private.",
-            parse_mode="Markdown"
-        )
-
-    elif data == "support":
-        sup = support_text()
-        await q.edit_message_text(f"🆘 Support: {sup}", reply_markup=back_kb())
-
-    elif data == "help_center":
-        await q.edit_message_text(help_center_text(), reply_markup=back_kb())
-
-    elif data == "admin":
-        if not is_admin(user.id):
-            await q.edit_message_text("Not allowed.", reply_markup=back_kb())
-            return
+    if q.data == "balance":
+        pts = get_points(user_id)
         await q.edit_message_text(
-            "🛠 Admin Panel\n\n"
-            "Commands:\n"
-            "/set_channels @ch1 @ch2\n"
-            "/set_refreward 1\n"
-            "/set_item Premium Reward | 4\n"
-            "/add_stock (multiline)\n"
-            "/stock_count\n"
-            "/broadcast your message\n"
-            "/ban 123\n"
-            "/unban 123\n"
-            "/add_points 123 10\n"
-            "/set_points 123 10\n"
-            "/stats\n",
-            reply_markup=admin_kb()
+            f"💰 *Your Balance:* `{pts}` point(s).",
+            reply_markup=back_btn(),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
-    elif data == "admin_stock":
-        if not is_admin(user.id):
-            return
+    elif q.data == "refer":
+        reward = int(get_setting("reward_per_ref") or "1")
+        link = f"https://t.me/{context.bot.username}?start={user_id}"
         await q.edit_message_text(
-            f"📦 Stock\n\nAvailable: {stock_available_count()}\n\n"
-            "Add stock like this:\n"
-            "/add_stock\n"
-            "CODE1\n"
-            "CODE2\n"
-            "...\n",
-            reply_markup=admin_kb()
+            "👥 *REFER*\n\n"
+            f"🔗 Your Link:\n`{link}`\n\n"
+            f"⭐ Reward per join+verify: *{reward}* point(s).",
+            reply_markup=back_btn(),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
-    elif data == "admin_broadcast":
-        if not is_admin(user.id):
-            return
+    elif q.data == "support":
+        sup = get_setting("support_user") or "@Support"
         await q.edit_message_text(
-            "📣 Broadcast\n\nUse:\n/broadcast Your message here",
-            reply_markup=admin_kb()
+            f"🆘 Support: {sup}",
+            reply_markup=back_btn(),
         )
 
-    elif data == "admin_stats":
-        if not is_admin(user.id):
-            return
+    elif q.data == "stock":
+        # example item/price
+        c = stock_count("Netflix Account", 4)
         await q.edit_message_text(
-            f"👤 Stats\n\nUsers: {users_count()}\nStock: {stock_available_count()}\n",
-            reply_markup=admin_kb()
+            f"📦 Stock for Netflix Account [4 points]: *{c}* item(s) available.",
+            reply_markup=back_btn(),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
-    elif data == "admin_settings":
-        if not is_admin(user.id):
-            return
-        ch1, ch2 = get_channels()
+    elif q.data == "withdraw":
         await q.edit_message_text(
-            "⚙️ Settings\n\n"
-            f"Channels:\n1) {ch1}\n2) {ch2}\n\n"
-            f"Referral reward: {ref_reward_points()}\n"
-            f"Item: {item_name()} | Price: {item_price()}\n"
-            f"Support: {support_text()}\n\n"
-            "Set with commands:\n"
-            "/set_channels @ch1 @ch2\n"
-            "/set_refreward 1\n"
-            "/set_item Name | Price\n"
-            "/set_support @Support\n"
-            "/set_helpcenter text...\n",
-            reply_markup=admin_kb()
+            "💳 WITHDRAW\nChoose item:",
+            reply_markup=withdraw_menu(),
         )
+
+    elif q.data == "buy_netflix_4":
+        price = 4
+        pts = get_points(user_id)
+        if pts < price:
+            await q.edit_message_text(
+                f"❌ Not enough points.\nYou have {pts}, need {price}.",
+                reply_markup=withdraw_menu(),
+            )
+            return
+
+        # claim stock first (to ensure availability), then take points
+        payload = claim_one_stock("Netflix Account", price, user_id)
+        if not payload:
+            await q.edit_message_text(
+                "❌ Out of stock.\nCome back later.",
+                reply_markup=withdraw_menu(),
+            )
+            return
+
+        # deduct points
+        ok = take_points(user_id, price)
+        if not ok:
+            # rollback is complex; keep simple: give back stock by messaging admin
+            await q.edit_message_text(
+                "❌ Error deducting points. Contact support.",
+                reply_markup=withdraw_menu(),
+            )
+            # notify admin
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ Deduct failed after stock claim. user={user_id}",
+                )
+            except Exception:
+                pass
+            return
+
+        await q.edit_message_text(
+            "✅ Success!\nHere is your item:\n\n"
+            f"```\n{payload}\n```",
+            reply_markup=back_btn(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif q.data == "back":
+        await q.edit_message_text(
+            "✅ Main menu:",
+            reply_markup=main_menu(),
+        )
+
+    elif q.data == "joined_check":
+        await on_joined_check(update, context)
 
 # =========================
 # ADMIN COMMANDS
 # =========================
-async def admin_guard(update: Update) -> bool:
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Admin only.")
-        return False
-    return True
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+
+    txt = (
+        "🛠 ADMIN COMMANDS:\n"
+        "/set_channels @channel1 @channel2\n"
+        "/set_support @username\n"
+        "/set_ref_reward 1\n"
+        "/add_stock 4 | Netflix Account | email:pass\n"
+        "/ban 123\n"
+        "/unban 123\n"
+        "/add_points 123 10\n"
+        "/broadcast your message...\n"
+    )
+    await update.message.reply_text(txt)
 
 async def set_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage:\n/set_channels @channel1 @channel2")
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    ch1 = normalize_channel(context.args[0])
-    ch2 = normalize_channel(context.args[1])
-    set_setting("ch1", ch1)
-    set_setting("ch2", ch2)
-    await update.message.reply_text(f"✅ Channels saved:\n1) {ch1}\n2) {ch2}\n\n⚠️ Add bot as ADMIN in both channels!")
+
+    parts = context.args
+    if not parts or len(parts) < 1:
+        await update.message.reply_text("Usage: /set_channels @animatrix2026 @animatrix27")
+        return
+
+    chans = []
+    for p in parts:
+        p = p.strip()
+        if p.startswith("https://t.me/"):
+            p = "@"+p.replace("https://t.me/", "").strip()
+        if not p.startswith("@"):
+            p = "@"+p
+        chans.append(p)
+
+    set_setting("required_channels", ",".join(chans))
+    await update.message.reply_text(f"✅ Required channels set:\n" + "\n".join(chans))
 
 async def set_support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+
     if not context.args:
-        await update.message.reply_text("Usage:\n/set_support @Support")
+        await update.message.reply_text("Usage: /set_support @SupportUser")
         return
-    set_setting("support", context.args[0].strip())
-    await update.message.reply_text(f"✅ Support saved: {support_text()}")
+    sup = context.args[0].strip()
+    if not sup.startswith("@"):
+        sup = "@"+sup
+    set_setting("support_user", sup)
+    await update.message.reply_text(f"✅ Support set to {sup}")
 
-async def set_helpcenter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+async def set_ref_reward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
-    text = update.message.text.split(" ", 1)
-    if len(text) < 2 or not text[1].strip():
-        await update.message.reply_text("Usage:\n/set_helpcenter your help text here...")
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    set_setting("help_center", text[1].strip())
-    await update.message.reply_text("✅ Help Center saved.")
 
-async def set_refreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not context.args:
+        await update.message.reply_text("Usage: /set_ref_reward 1")
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage:\n/set_refreward 1")
+    try:
+        n = int(context.args[0])
+        if n < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Invalid number.")
         return
-    set_setting("ref_reward", str(int(context.args[0])))
-    await update.message.reply_text(f"✅ Referral reward = {ref_reward_points()}")
-
-async def set_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /set_item Premium Reward | 4
-    """
-    if not await admin_guard(update):
-        return
-    raw = update.message.text.replace("/set_item", "", 1).strip()
-    if "|" not in raw:
-        await update.message.reply_text("Usage:\n/set_item Name | Price\nExample:\n/set_item Premium Reward | 4")
-        return
-    name, price = [x.strip() for x in raw.split("|", 1)]
-    if not name:
-        await update.message.reply_text("❌ Name is empty.")
-        return
-    if not price.isdigit():
-        await update.message.reply_text("❌ Price must be a number.")
-        return
-    set_setting("item_name", name)
-    set_setting("item_price", price)
-    await update.message.reply_text(f"✅ Item saved: {item_name()} | Price: {item_price()}")
+    set_setting("reward_per_ref", str(n))
+    await update.message.reply_text(f"✅ Referral reward set to {n}")
 
 async def add_stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /add_stock
-    CODE1
-    CODE2
-    """
-    if not await admin_guard(update):
+    if not update.message:
         return
-    text = update.message.text.split("\n", 1)
-    if len(text) < 2 or not text[1].strip():
-        await update.message.reply_text(
-            "Usage:\n/add_stock\nCODE1\nCODE2\n...\n\nEach line = one code/serial you own."
-        )
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    lines = [x.strip() for x in text[1].splitlines() if x.strip()]
-    n = add_stock_items(lines)
-    await update.message.reply_text(f"✅ Added {n} stock item(s).\nAvailable: {stock_available_count()}")
 
-async def stock_count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    # format: /add_stock 4 | Netflix Account | email:pass
+    text = update.message.text or ""
+    raw = text.replace("/add_stock", "", 1).strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 3:
+        await update.message.reply_text("Usage:\n/add_stock 4 | Netflix Account | email:pass")
         return
-    await update.message.reply_text(f"📦 Available stock: {stock_available_count()}")
+    try:
+        price = int(parts[0])
+    except Exception:
+        await update.message.reply_text("Invalid price.")
+        return
+    item = parts[1]
+    payload = "|".join(parts[2:]).strip()
+    add_stock(item=item, price=price, payload=payload)
+    await update.message.reply_text(f"✅ Added stock: {item} [{price}]")
 
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage:\n/ban USER_ID")
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    uid = int(context.args[0])
-    set_ban(uid, True)
-    await update.message.reply_text(f"✅ Banned {uid}")
+    if not context.args:
+        await update.message.reply_text("Usage: /ban 123")
+        return
+    target = int(context.args[0])
+    conn = db()
+    cur = conn.cursor()
+    ensure_user(target)
+    cur.execute("UPDATE users SET banned=1 WHERE user_id=?", (target,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Banned {target}")
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage:\n/unban USER_ID")
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    uid = int(context.args[0])
-    set_ban(uid, False)
-    await update.message.reply_text(f"✅ Unbanned {uid}")
+    if not context.args:
+        await update.message.reply_text("Usage: /unban 123")
+        return
+    target = int(context.args[0])
+    conn = db()
+    cur = conn.cursor()
+    ensure_user(target)
+    cur.execute("UPDATE users SET banned=0 WHERE user_id=?", (target,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Unbanned {target}")
 
 async def add_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
-    if len(context.args) != 2 or (not context.args[0].isdigit()) or (not re.fullmatch(r"-?\d+", context.args[1])):
-        await update.message.reply_text("Usage:\n/add_points USER_ID AMOUNT")
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    uid = int(context.args[0])
-    amt = int(context.args[1])
-    add_points(uid, amt)
-    await update.message.reply_text(f"✅ Added {amt} points to {uid}")
-
-async def set_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /add_points user_id amount")
         return
-    if len(context.args) != 2 or (not context.args[0].isdigit()) or (not context.args[1].isdigit()):
-        await update.message.reply_text("Usage:\n/set_points USER_ID POINTS")
-        return
-    uid = int(context.args[0])
-    pts = int(context.args[1])
-    set_points(uid, pts)
-    await update.message.reply_text(f"✅ Set points of {uid} to {pts}")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
-        return
-    con = db()
-    p = con.execute("SELECT COUNT(*) AS c FROM purchases").fetchone()
-    con.close()
-    purchases = int(p["c"] or 0)
-    await update.message.reply_text(
-        f"📊 Stats\nUsers: {users_count()}\nStock: {stock_available_count()}\nPurchases: {purchases}"
-    )
+    target = int(context.args[0])
+    amount = int(context.args[1])
+    ensure_user(target)
+    add_points(target, amount)
+    await update.message.reply_text(f"✅ Added {amount} points to {target}")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update):
+    if not update.message:
         return
-    msg = update.message.text.replace("/broadcast", "", 1).strip()
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    text = update.message.text or ""
+    msg = text.replace("/broadcast", "", 1).strip()
     if not msg:
-        await update.message.reply_text("Usage:\n/broadcast your message here")
+        await update.message.reply_text("Usage: /broadcast your message...")
         return
 
-    con = db()
-    rows = con.execute("SELECT user_id FROM users").fetchall()
-    con.close()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE banned=0")
+    users = [int(r["user_id"]) for r in cur.fetchall()]
+    conn.close()
 
-    ok = 0
-    fail = 0
-    for r in rows:
-        uid = int(r["user_id"])
+    sent = 0
+    for u in users:
         try:
-            await context.bot.send_message(chat_id=uid, text=msg)
-            ok += 1
-        except:
-            fail += 1
-        await asyncio.sleep(0.06)  # لتجنب Flood
+            await context.bot.send_message(chat_id=u, text=msg)
+            sent += 1
+        except Exception:
+            pass
 
-    await update.message.reply_text(f"✅ Broadcast done.\nSent: {ok}\nFailed: {fail}")
+    await update.message.reply_text(f"✅ Broadcast done. Sent to {sent} users.")
 
 # =========================
 # MAIN
 # =========================
 def main():
     init_db()
-    ensure_defaults()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     # user
-    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
     # admin
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("set_channels", set_channels_cmd))
     app.add_handler(CommandHandler("set_support", set_support_cmd))
-    app.add_handler(CommandHandler("set_helpcenter", set_helpcenter_cmd))
-    app.add_handler(CommandHandler("set_refreward", set_refreward_cmd))
-    app.add_handler(CommandHandler("set_item", set_item_cmd))
+    app.add_handler(CommandHandler("set_ref_reward", set_ref_reward_cmd))
     app.add_handler(CommandHandler("add_stock", add_stock_cmd))
-    app.add_handler(CommandHandler("stock_count", stock_count_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("add_points", add_points_cmd))
-    app.add_handler(CommandHandler("set_points", set_points_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
+    # IMPORTANT: url_path uses BOT_TOKEN (hard to guess)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN,
         webhook_url=f"{APP_URL}/{BOT_TOKEN}",
-        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
